@@ -16,6 +16,9 @@ from pyspark.sql.functions import monotonically_increasing_id
 from pyspark.sql.types import StructType, StructField
 from pyspark.sql.types import DoubleType, StringType, IntegerType, DateType, LongType, TimestampType
 
+from pyspark.sql.window import Window
+from pyspark.sql.functions import row_number, desc
+
 def create_spark_session():
     """
     Description: Create spark session with hadoop-aws package.
@@ -56,23 +59,18 @@ def process_song_data(spark, input_data, output_data):
 
     # read song data file
     df = spark.read.json(song_data, schema=RawSongSchema)
-    df.createOrReplaceTempView("song_raw")
 
     # extract columns to create songs table
-    songs_table = spark.sql("""
-    SELECT song_id, title, artist_id, year, duration
-    FROM song_raw WHERE song_id is not null
-    """)
+    songs_table = df.select("song_id", "title", "artist_id", "year", "duration")\
+    .where("song_id is not null").dropDuplicates()
 
     # write songs table to parquet files partitioned by year and artist
     songs_table.write.parquet(output_data + '/song', mode="overwrite", partitionBy=['year','artist_id'])
 
     # extract columns to create artists table
-    artists_table = spark.sql("""
-    SELECT artist_id, artist_name,artist_location,
-    artist_latitude, artist_longitude
-    FROM song_raw WHERE artist_id is not null
-    """)
+    artists_table = df.select("artist_id", col("artist_name").alias("name"), \
+    col("artist_location").alias("location"), col("artist_latitude").alias("latitude"), \
+    col("artist_longitude").alias("longitude")).where("artist_id is not null").dropDuplicates()
 
     # write artists table to parquet files
     artists_table.write.parquet(output_data + '/artists', mode="overwrite")
@@ -103,7 +101,7 @@ def process_log_data(spark, input_data, output_data):
     StructField('location', StringType()),
     StructField('method', StringType()),
     StructField('page', StringType()),
-    StructField('registration', StringType()),
+    StructField('registration', DoubleType()),
     StructField('sessionId', IntegerType()),
     StructField('song', StringType()),
     StructField('status', IntegerType()),
@@ -116,17 +114,14 @@ def process_log_data(spark, input_data, output_data):
 
     # filter by actions for song plays
     df = df.select("*").where("page = 'NextSong'")
-    df.createOrReplaceTempView("log_raw")
 
     # extract columns for users table
-    users_table = spark.sql("""
-    select user_id, first_name, last_name, gender, level
-    from
-    (SELECT userId as user_id, firstName as first_name, lastName as last_name, gender, level
-    FROM log_raw
-    WHERE userId is not null)
-    group by 1,2,3,4,5
-    """)
+    users_table = df.select("userId", "firstName", "lastName", "gender", "level", "ts", \
+                            row_number().over(Window.partitionBy("userId").orderBy(col("ts").desc()))\
+                            .alias("ts_rank")).where("userId is not null")
+
+    users_table = users_table.selectExpr("userId as user_id", "firstName as first_name", \
+                                         "lastName as last_name", "gender", "level").where("ts_rank = 1")
 
     # write users table to parquet files
     users_table.write.parquet(output_data + '/users', mode="overwrite")
@@ -142,21 +137,14 @@ def process_log_data(spark, input_data, output_data):
     df = df.withColumn("start_time", get_timestamp("ts"))
     df.createOrReplaceTempView("log_raw")
 
-    # create datetime column from original timestamp column
-    # get_datetime = udf()
-    # df =
-
     # extract columns to create time table
     time_table = spark.sql("""
-    select start_time, hour, day, week, month, year, weekday
-    from
-    (SELECT start_time, hour(start_time) as hour, dayofmonth(start_time) as day,
+    SELECT start_time, hour(start_time) as hour, dayofmonth(start_time) as day,
     weekofyear(start_time) as week, month(start_time) as month,
     year(start_time) as year, date_format(start_time,'E') as weekday
     FROM log_raw
-    WHERE start_time is not null)
-    group by 1,2,3,4,5,6,7
-    """)
+    WHERE start_time is not null
+    """).dropDuplicates()
 
     # write time table to parquet files partitioned by year and month
     time_table.write.parquet(output_data + '/time', mode="overwrite", partitionBy=['year','month'])
@@ -177,18 +165,18 @@ def process_log_data(spark, input_data, output_data):
     SELECT songplay_id, start_time, b.song_id as song_id, c.artist_id as artist_id,
     userId as user_id,
     sessionId as session_id,
-    location,
+    a.location,
     level,
     userAgent as user_agent
     FROM log_raw a
     left join songs b
     on a.song = b.title
     left join artists c
-    on a.artist = c.artist_name
-    """)
+    on a.artist = c.name
+    """).dropDuplicates()
 
     # write songplays table to parquet files partitioned by year and month
-    songplays_table.write.parquet(output_data + 'songplays', mode="overwrite")
+    songplays_table.write.parquet(output_data + '/songplays', mode="overwrite")
 
 
 def main():
